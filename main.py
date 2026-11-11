@@ -193,6 +193,17 @@ class Analysis:
                 if target is not None and target != seat:
                     self.accusations.append((seat, target, day, True))
         # "I checked seat N: (not) a wolf" / "seat N is a villager / innocent".
+        # A checked-wolf reveal ("I checked seat N ... they are a werewolf")
+        # is a strong accusation of N, not just a vote call: the seer's
+        # reveal must land as evidence, or the village never follows it.
+        for m in re.finditer(r"checked\s+seat\s+(\d+)[^.]{0,80}?(?:they|he|she)\s+(?:are|is)\s+(?:a\s+|the\s+)?(?:werewolf|wolf)\b", t):
+            target = self._seat_of_mention(t, m)
+            if target is not None and target != seat:
+                self.accusations.append((seat, target, day, True))
+        for m in re.finditer(r"checked\s+(" + _NAME_WORD + r")[^.]{0,80}?(?:they|he|she)\s+(?:are|is)\s+(?:a\s+|the\s+)?(?:werewolf|wolf)\b", t):
+            target = self._seat_of_mention(t, m)
+            if target is not None and target != seat:
+                self.accusations.append((seat, target, day, True))
         for m in re.finditer(r"checked\s+seat\s+(\d+)[^.]{0,50}?(not a wolf|not a werewolf|villager|innocent|clear)", t):
             target = self._seat_of_mention(t, m)
             if target is not None and target != seat:
@@ -337,6 +348,35 @@ def _best_by_score(options, score, seed, *salt):
     return _rng(seed, *salt).choice(tied)
 
 
+def _entry_kill(a, options):
+    """Entry-only wolf kill (the house never runs this; decide() calls it
+    instead of decide_kill). Coordination first (match the partner's pick
+    already cast tonight), then one rule the house never uses: a blocked
+    kill last night means the doctor protected that target -- and the rules
+    forbid the doctor from protecting the same seat two nights running. So
+    if both wolves agreed on a target last night and nobody died, name it
+    again tonight: the doctor cannot save it a second time, so the kill is
+    guaranteed. Otherwise fall back to the shared kill scoring."""
+    if not options:
+        return None
+    for v in a.wolf_votes:
+        if v.get("night") == a.day and v.get("seat") == a.partner and v.get("target") in options:
+            return v["target"]
+    if a.day >= 2:
+        last = [v for v in a.wolf_votes
+                if v.get("night") == a.day - 1 and v.get("target") is not None]
+        picks = {v["target"] for v in last}
+        if len(picks) == 1:
+            target = next(iter(picks))
+            dawn = None
+            for e in a.log:
+                if e.get("kind") == "dawn" and e.get("day") == a.day - 1:
+                    dawn = e
+            if dawn is not None and dawn.get("died") is None and target in options:
+                return target
+    return decide_kill(a, options)
+
+
 def decide_kill(a, options):
     """Wolf night kill. Match the partner's vote when cast; else name the
     best target so the partner can match (a split vote kills nobody)."""
@@ -432,6 +472,101 @@ def decide_vote_village(a, options):
     return None  # no case worth an exile: abstain rather than guess
 
 
+def _entry_vote_village(a, options):
+    """Entry-only village vote (the house never runs this; decide() calls it
+    instead of decide_vote_village). Same spine -- known wolf first, then a
+    real case -- plus one thing the house never does: on a weak-evidence day
+    a random exile hurts the village far more than no exile (in practice
+    day-1 exiles hit a villager about four times in five, power roles
+    included), so when the forming leader's case is weak, or the leader is
+    someone the entry knows is village, or the entry itself is leading,
+    vote for the runner-up to tie the leader instead of joining the
+    bandwagon. With no leader yet and no case, abstain rather than create
+    a leader out of guesswork."""
+    if not options:
+        return None
+    for w in a.known_wolves:
+        if w in options:
+            return w
+    cands = [o for o in options if o not in a.known_village]
+    if not cands:
+        return None
+    tally = a.current_votes()
+    ranked = sorted(cands, key=lambda s: -a.suspicion.get(s, 0.0))
+    top = ranked[0]
+    top_score = a.suspicion.get(top, 0.0)
+    # Endgame: when one more night kill brings parity (non-wolves left at
+    # most one more than wolves alive), a no-exile day loses outright, so
+    # the tie-forcing and abstaining below are switched off -- vote the
+    # best suspect available, however weak the case.
+    dead_wolves = sum(1 for r in a.revealed.values() if r == "werewolf")
+    wolves_alive = 2 - dead_wolves
+    non_wolves = len(a.living) - wolves_alive
+    if non_wolves <= wolves_alive + 1:
+        return top
+    leader = max(tally, key=lambda s: (tally[s], -s)) if tally else None
+
+    def runner_up():
+        alts = [o for o in cands if o != leader]
+        if not alts:
+            return None
+        return max(alts, key=lambda s: (tally.get(s, 0), a.suspicion.get(s, 0.0), -s))
+
+    if leader is not None:
+        if leader == a.me:
+            return runner_up()  # tie myself out of the lead, or abstain
+        if leader in a.known_village:
+            return runner_up()  # never help exile someone known innocent
+        if leader in cands and a.suspicion.get(leader, 0.0) < 1.0:
+            return runner_up()  # weak case: tie the leader, don't crown them
+    if top_score >= 1.0:
+        if (leader is not None and leader in cands and leader != top
+                and a.suspicion.get(leader, 0.0) >= 1.0
+                and tally.get(leader, 0) >= tally.get(top, 0) + 1):
+            return leader  # consolidate a plausible exile already forming
+        return top
+    return None  # no case worth an exile: abstain rather than guess
+
+
+def _entry_vote_wolf(a, options):
+    """Entry-only wolf vote (the house never runs this; decide() calls it
+    instead of decide_vote_wolf). Same spine -- join a villager leader,
+    split when the partner leads -- plus one thing the house never does:
+    pivotal voting. Every vote for a villager who is then exiled costs the
+    voter suspicion, while an abstention costs nothing, so when a villager
+    leader's exile is already assured without the entry's vote (their lead
+    over the runner-up beats the number of voters still to come), abstain
+    and let the village exile them on its own votes. Vote only when the
+    entry's ballot can still change the outcome."""
+    if not options:
+        return None
+    villagers = [o for o in options if o != a.partner]
+    if not villagers:
+        return None
+    tally = a.current_votes()
+    # Votes already cast in this voting phase (abstentions included).
+    start = 0
+    for i, e in enumerate(a.log):
+        if e.get("kind") == "voting":
+            start = i
+    cast = sum(1 for e in a.log[start:] if e.get("kind") == "vote")
+    remaining = len(a.living) - cast - 1  # voters still to come after me
+    leader = max(tally, key=lambda s: (tally[s], -s)) if tally else None
+    if leader == a.partner:
+        # Partner is being exiled: split onto the best villager alternative.
+        others = [v for v in villagers if tally.get(v, 0) > 0]
+        pool = others if others else villagers
+        return _best_by_score(pool, lambda t: a.suspicion.get(t, 0.0), a.seed,
+                              "wolfvote", a.game_no, a.day, len(a.log))
+    if leader is not None and leader in villagers:
+        runner_votes = max([v for s, v in tally.items() if s != leader], default=0)
+        if tally[leader] - runner_votes > remaining:
+            return None  # exile assured without me: abstain, dodge the penalty
+        return leader
+    return _best_by_score(villagers, lambda t: a.suspicion.get(t, 0.0), a.seed,
+                          "wolfvote", a.game_no, a.day, len(a.log))
+
+
 def decide_vote_wolf(a, options):
     """Wolf: vote with the village when the target is a villager. If the
     partner leads the vote, vote elsewhere to try to force a tie instead."""
@@ -460,6 +595,37 @@ def _pick(rng, templates):
     return templates[rng.randint(0, len(templates) - 1)]
 
 
+def _entry_speak(a, max_chars):
+    """Entry-only speak gate (the house never runs this; decide() calls it
+    instead of speak()). A baseless accusation is worse than silence: the
+    village's own suspicion rules punish whoever accused a later-revealed
+    villager, so a day-one guess usually paints the accuser and misleads
+    the table. When the entry has no real case -- no checked wolf, no false
+    seer to counter, no accusation to answer, and the top suspect scores
+    under 1.0 -- say plainly that there is no case yet instead of naming
+    one. Reveals, counter-claims and defences still go through speak()."""
+    suspects = a.top_suspects()
+    top = suspects[0] if suspects else None
+    top_score = a.suspicion.get(top, 0.0) if top is not None else 0.0
+    has_wolf = any(w in a.living for w in a.checked_wolf)
+    # Only the seer needs the counter-claim exception: for other village
+    # roles somebody else's seer claim is no reason to accuse on a guess.
+    false_claim = a.role == "seer" and bool(a.claimed_seer_alive())
+    if (a.role != "werewolf" and not has_wolf and not false_claim
+            and not a.am_accused() and top_score < 1.0):
+        rng = _rng(a.seed, "speak-neutral", a.game_no, a.day, len(a.log))
+        templates = [
+            "Day %d, and I have no solid read yet. I would rather hear everyone than push a name on guesswork." % a.day,
+            "Little to go on so far. I am listening, and I will vote on what the day actually shows.",
+            "No strong case yet today. Let us hear the whole table before anyone's name sticks.",
+            "Nothing has convinced me yet. I will keep watching and vote on evidence, not noise.",
+        ]
+        return _cut(_pick(rng, templates), max_chars)
+    if a.role == "werewolf":
+        return _entry_speak_wolf(a, max_chars)
+    return speak(a, max_chars)
+
+
 def speak(a, max_chars):
     """One debate statement (or None to pass), role-aware and evidence-based."""
     rng = _rng(a.seed, "speak", a.game_no, a.day, len(a.log))
@@ -476,6 +642,51 @@ def speak(a, max_chars):
     if a.role == "seer":
         return _speak_seer(a, rng, top, max_chars)
     return _speak_villager(a, rng, top, max_chars)
+
+
+def _entry_speak_wolf(a, max_chars):
+    """Entry-only wolf speak: the same voice as _speak_wolf, but it never
+    names the partner as a suspect -- not as the accusation target, and not
+    even inside a 'before we settle on X' deflection, which only puts the
+    partner's name in the frame as a candidate for exile. The partner is
+    defended by redirecting at the best non-partner suspect, never by
+    discussing them. (The shared _speak_wolf can bus the partner whenever
+    the village's own suspicion puts them on top; the entry must not.)"""
+    rng = _rng(a.seed, "speak", a.game_no, a.day, len(a.log))
+    if a.day == 1 and rng.random() < 0.15:
+        return None
+    if rng.random() < 0.05:
+        return None
+    suspects = [s for s in a.top_suspects() if s != a.partner]
+    top = suspects[0] if suspects else None
+    if a.am_accused() and top is not None:
+        text = ("I am a villager, and my votes have followed the evidence. "
+                "Look at %s instead: %s" % (a.names[top], a.evidence_reason(top)))
+        return _cut(text, max_chars)
+    if top is None:
+        return _cut("Not much to go on yet. I will listen and vote on what the day shows.", max_chars)
+    if a.partner is not None and a.suspicion.get(a.partner, 0.0) >= 2.0:
+        templates = [
+            "%s worries me more than the names so far: %s" % (
+                a.names[top], a.evidence_reason(top)),
+            "Before we settle on anyone, look at %s. %s" % (
+                a.names[top], a.evidence_reason(top)),
+        ]
+        return _cut(_pick(rng, templates), max_chars)
+    reason = a.evidence_reason(top)
+    name = a.names[top]
+    templates = [
+        "Seat %d (%s) is where my vote is going. %s" % (top, name, reason),
+        "I keep coming back to seat %d (%s). %s I am open to another name, but that is my read." % (top, name, reason),
+        "Seat %d (%s) has not added up for me. %s" % (top, name, reason),
+        "I agree with the case on seat %d (%s). %s" % (top, name, reason),
+        "Seat %d, why did you vote the way you did yesterday? %s" % (top, reason),
+        "The night kill points at someone who wanted the village weaker. Seat %d (%s) fits that best: %s" % (top, name, reason),
+    ]
+    if a.day == 1:
+        templates.append(
+            "First day, little to go on. I will watch seat %d (%s) for now: %s" % (top, name, reason))
+    return _cut(_pick(rng, templates), max_chars)
 
 
 def _speak_wolf(a, rng, top, max_chars):
@@ -575,21 +786,21 @@ def decide(a, pending):
     kind = pending.get("decision")
     game = pending.get("game")
     if kind == "speak":
-        text = speak(a, pending.get("max_chars") or 500)
+        text = _entry_speak(a, pending.get("max_chars") or 500)
         if text is None:
             return {"game": game, "decision": "speak", "pass": True}
         return {"game": game, "decision": "speak", "text": text}
     options = pending.get("options") or []
     if kind == "kill":
-        return {"game": game, "decision": "kill", "target": decide_kill(a, options)}
+        return {"game": game, "decision": "kill", "target": _entry_kill(a, options)}
     if kind == "protect":
         return {"game": game, "decision": "protect", "target": decide_protect(a, options)}
     if kind == "inspect":
         return {"game": game, "decision": "inspect", "target": decide_inspect(a, options)}
     if kind == "vote":
         if a.role == "werewolf":
-            return {"game": game, "decision": "vote", "target": decide_vote_wolf(a, options)}
-        return {"game": game, "decision": "vote", "target": decide_vote_village(a, options)}
+            return {"game": game, "decision": "vote", "target": _entry_vote_wolf(a, options)}
+        return {"game": game, "decision": "vote", "target": _entry_vote_village(a, options)}
     return {"game": game, "decision": kind, "target": None}
 
 
