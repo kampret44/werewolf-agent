@@ -221,6 +221,17 @@ class Analysis:
             target = self._seat_of_mention(t, m)
             if target is not None and target != seat:
                 self.accusations.append((seat, target, day, False))
+        # Weaker phrasings of the same accusation ("I suspect seat N",
+        # "seat N is suspicious", "vote for <Name>"): a model house
+        # player rarely repeats the exact "seat N is a wolf" formula.
+        for pat in (r"(?:i suspect|suspect|suspicious of)\s+seat\s+(\d+)",
+                    r"seat\s+(\d+)\s+is\s+suspicious",
+                    r"seat\s+(\d+)\s+(?:looks|seems|acts)\s+(?:suspicious|sketchy|shady|wolfy)",
+                    r"(?:i suspect|suspicious of|vote for|vote)\s+(" + _NAME_WORD + r")\b"):
+            for m in re.finditer(pat, t):
+                target = self._seat_of_mention(t, m)
+                if target is not None and target != seat:
+                    self.accusations.append((seat, target, day, False))
 
     # -- derived beliefs --------------------------------------------------
     def _trusted(self):
@@ -245,12 +256,30 @@ class Analysis:
             if accuser in self.seer_claims:
                 w += 1.3
             s[target] = s.get(target, 0.0) + w
-        # Two seer claims (or two doctor claims): one of them is lying.
+        # Two seer claims (or two doctor claims): one of them is lying --
+        # but the FIRST claim is the more credible one (the real role
+        # claims when they have something; a wolf claims to counter it).
+        # Grade by claim order (dict order is first-claim order).
         for claims in (self.seer_claims, self.doctor_claims):
             living_claimants = [c for c in claims if c in s]
             if len(living_claimants) >= 2:
+                first = living_claimants[0]
                 for c in living_claimants:
-                    s[c] = s.get(c, 0.0) + 2.0
+                    s[c] = s.get(c, 0.0) + (1.0 if c == first else 2.5)
+        # A seat claiming two different power roles contradicts itself.
+        for seat in s:
+            if seat in self.seer_claims and seat in self.doctor_claims:
+                s[seat] = s.get(seat, 0.0) + 2.0
+        # A clear from an uncontested seer claim is credible: the cleared
+        # seat is less suspicious. Contested claims earn no clear credit --
+        # one of the claimants is lying, and a wolf's fake clear must not
+        # shield its partner.
+        living_seers = [c for c in self.seer_claims if c in self.living]
+        if len(living_seers) == 1:
+            only = living_seers[0]
+            for (claimer, target, _d) in self.clears_claimed:
+                if claimer == only and target in s:
+                    s[target] = s.get(target, 0.0) - 1.0
         # A claim that later proved false: the claimer is likely a wolf.
         for (claimer, target, _d) in self.clears_claimed:
             if self.revealed.get(target) == "werewolf" and claimer in s:
@@ -258,16 +287,40 @@ class Analysis:
         for (accuser, target, _d, _strong) in self.accusations:
             if self.revealed.get(target) in ("seer", "doctor", "villager") and accuser in s:
                 s[accuser] = s.get(accuser, 0.0) + 1.0
-        # Vote history against revealed roles.
+        # Vote history against revealed roles. Voting a revealed wolf
+        # clears the voter -- but only once per wolf: a wolf bussing its
+        # partner must not bank a permanent alibi from one vote. The old
+        # -2.5 per vote let a bussing last wolf sit at -5.0, the cleanest
+        # seat at the table, while the village stalled and lost on parity.
+        credited = set()
         for (_d, voter, target) in self.votes:
             if voter not in s or target is None:
                 continue
             if self.revealed.get(target) == "werewolf":
-                s[voter] = s.get(voter, 0.0) - 2.5
+                if (voter, target) not in credited:
+                    credited.add((voter, target))
+                    s[voter] = s.get(voter, 0.0) - 1.5
             elif self.revealed.get(target) in ("seer", "doctor", "villager"):
                 s[voter] = s.get(voter, 0.0) + 1.2
-            if target is None:
-                s[voter] = s.get(voter, 0.0) + 0.2
+        # Night kills: the wolves kill villagers who threaten them. A
+        # victim is confirmed village, so their accusations and votes are
+        # honest -- and being killed for them makes their targets more
+        # suspicious still. This is the main signal for the last wolf,
+        # who otherwise hides behind a bussing vote.
+        for e in self.log:
+            if e.get("kind") != "dawn" or e.get("died") is None:
+                continue
+            victim = e["died"]
+            dday = e.get("day", 99)
+            bonus = {}
+            for (accuser, target, _d, strong) in self.accusations:
+                if accuser == victim and _d < dday and target in s:
+                    bonus[target] = max(bonus.get(target, 0.0), 0.8 if strong else 0.4)
+            for (_d, voter, target) in self.votes:
+                if voter == victim and _d < dday and target is not None and target in s:
+                    bonus[target] = max(bonus.get(target, 0.0), 0.5)
+            for target, w in bonus.items():
+                s[target] = s.get(target, 0.0) + w
         # Silence: never spoke while others debated.
         if self.day >= 2:
             for seat in s:
@@ -475,14 +528,16 @@ def decide_vote_village(a, options):
 def _entry_vote_village(a, options):
     """Entry-only village vote (the house never runs this; decide() calls it
     instead of decide_vote_village). Same spine -- known wolf first, then a
-    real case -- plus one thing the house never does: on a weak-evidence day
-    a random exile hurts the village far more than no exile (in practice
-    day-1 exiles hit a villager about four times in five, power roles
-    included), so when the forming leader's case is weak, or the leader is
-    someone the entry knows is village, or the entry itself is leading,
-    vote for the runner-up to tie the leader instead of joining the
-    bandwagon. With no leader yet and no case, abstain rather than create
-    a leader out of guesswork."""
+    real case -- plus two restraints the house never uses. (1) Day 1 has
+    almost no evidence, and a wrong day-1 exile costs the village the game
+    in two more days, so on day 1 only a strong case (>= 2.0: two accusers,
+    or an accusation plus a seer claim) justifies an exile; on a weak case
+    abstain rather than guess. (2) Tying a weak leader only works when the
+    entry is (nearly) last to vote: an early tie is broken by later voters
+    and the entry's ballot then just adds to a villager's pile, so vote the
+    runner-up only when it ties the leader exactly and at most one voter
+    comes after me. With no leader yet and no case, abstain rather than
+    create a leader out of guesswork."""
     if not options:
         return None
     for w in a.known_wolves:
@@ -504,26 +559,55 @@ def _entry_vote_village(a, options):
     non_wolves = len(a.living) - wolves_alive
     if non_wolves <= wolves_alive + 1:
         return top
+    # Voters still to come after me in this phase.
+    start = 0
+    for i, e in enumerate(a.log):
+        if e.get("kind") == "voting":
+            start = i
+    cast = sum(1 for e in a.log[start:] if e.get("kind") == "vote")
+    remaining = len(a.living) - cast - 1
     leader = max(tally, key=lambda s: (tally[s], -s)) if tally else None
 
-    def runner_up():
+    def tie_leader():
+        """Vote the runner-up only when it ties the leader exactly and I
+        am nearly last, so the tie holds and nobody is exiled."""
+        if leader is None or remaining > 1:
+            return None
         alts = [o for o in cands if o != leader]
         if not alts:
             return None
-        return max(alts, key=lambda s: (tally.get(s, 0), a.suspicion.get(s, 0.0), -s))
+        ru = max(alts, key=lambda s: (tally.get(s, 0), a.suspicion.get(s, 0.0), -s))
+        if tally.get(leader, 0) == tally.get(ru, 0) + 1:
+            return ru
+        return None
 
     if leader is not None:
         if leader == a.me:
-            return runner_up()  # tie myself out of the lead, or abstain
-        if leader in a.known_village:
-            return runner_up()  # never help exile someone known innocent
-        if leader in cands and a.suspicion.get(leader, 0.0) < 1.0:
-            return runner_up()  # weak case: tie the leader, don't crown them
-    if top_score >= 1.0:
+            tied = tie_leader()  # tie myself out of the lead, or fall through
+            if tied is not None:
+                return tied
+        elif leader in a.known_village:
+            tied = tie_leader()  # never help exile someone known innocent
+            if tied is not None:
+                return tied
+        elif leader in cands and a.suspicion.get(leader, 0.0) < 1.0:
+            tied = tie_leader()  # weak case: tie the leader, don't crown them
+            if tied is not None:
+                return tied
+    need = 2.0 if a.day == 1 else 1.0
+    if top_score >= need:
         if (leader is not None and leader in cands and leader != top
-                and a.suspicion.get(leader, 0.0) >= 1.0
+                and a.suspicion.get(leader, 0.0) >= need
                 and tally.get(leader, 0) >= tally.get(top, 0) + 1):
             return leader  # consolidate a plausible exile already forming
+        if (a.day >= 2 and leader is not None and leader in cands and leader != top
+                and a.suspicion.get(leader, 0.0) >= 0.5
+                and tally.get(leader, 0) >= 2
+                and tally.get(top, 0) == 0):
+            # My suspect has no traction while a plausible leader is
+            # forming: a scattered vote exiles nobody and the night kill
+            # still lands, so secure the exile instead.
+            return leader
         return top
     return None  # no case worth an exile: abstain rather than guess
 
@@ -531,13 +615,18 @@ def _entry_vote_village(a, options):
 def _entry_vote_wolf(a, options):
     """Entry-only wolf vote (the house never runs this; decide() calls it
     instead of decide_vote_wolf). Same spine -- join a villager leader,
-    split when the partner leads -- plus one thing the house never does:
-    pivotal voting. Every vote for a villager who is then exiled costs the
-    voter suspicion, while an abstention costs nothing, so when a villager
-    leader's exile is already assured without the entry's vote (their lead
-    over the runner-up beats the number of voters still to come), abstain
-    and let the village exile them on its own votes. Vote only when the
-    entry's ballot can still change the outcome."""
+    split when the partner leads -- plus two things the house never does:
+    pivotal voting and bussing. Every vote for a villager who is then
+    exiled costs the voter suspicion, while an abstention costs nothing,
+    so when a villager leader's exile is already assured without the
+    entry's vote (their lead over the runner-up beats the number of voters
+    still to come), abstain and let the village exile them on its own
+    votes. And when the partner leads and their exile is inevitable --
+    the ledger heavily against them, or their lead decisive with almost
+    nobody left to vote -- bus them: vote the partner out with the village
+    instead of defending a lost cause, banking village trust (and the
+    "voted a wolf" credit) for the endgame as a lone wolf. Vote only when
+    the entry's ballot can still change the outcome."""
     if not options:
         return None
     villagers = [o for o in options if o != a.partner]
@@ -553,6 +642,10 @@ def _entry_vote_wolf(a, options):
     remaining = len(a.living) - cast - 1  # voters still to come after me
     leader = max(tally, key=lambda s: (tally[s], -s)) if tally else None
     if leader == a.partner:
+        runner_votes = max([v for s, v in tally.items() if s != leader], default=0)
+        if (a.suspicion.get(a.partner, 0.0) >= 2.5
+                or (tally.get(leader, 0) - runner_votes >= 2 and remaining <= 1)):
+            return a.partner  # bus: the partner is doomed; bank the trust
         # Partner is being exiled: split onto the best villager alternative.
         others = [v for v in villagers if tally.get(v, 0) > 0]
         pool = others if others else villagers
@@ -595,24 +688,78 @@ def _pick(rng, templates):
     return templates[rng.randint(0, len(templates) - 1)]
 
 
+def _vote_intent(a):
+    """The seat the entry would vote for on the evidence alone (no tally):
+    a checked wolf first, else the top suspect when the case is real."""
+    for w in a.checked_wolf:
+        if w in a.living:
+            return w
+    cands = [s for s in a.top_suspects() if s not in a.known_village]
+    if not cands:
+        return None
+    top = cands[0]
+    return top if a.suspicion.get(top, 0.0) >= 1.0 else None
+
+
+def _entry_accuse(a, target, max_chars, defence=False):
+    """Entry-only accusation. Worded so the accusation itself is parseable
+    ("seat N is a wolf", "Vote for seat N"): other players, model or
+    heuristic, must be able to tell who is accused and why. The old
+    templates ("seat N (Name) is a wolf") put the name between the seat
+    number and "is", so no parser ever matched them and the entry's votes
+    were never argued for -- the village never followed a silent vote."""
+    rng = _rng(a.seed, "speak", a.game_no, a.day, len(a.log))
+    reason = a.evidence_reason(target)
+    name = a.names[target]
+    templates = [
+        "I think seat %d is a wolf. %s Vote for seat %d." % (target, reason, target),
+        "Seat %d is a wolf. %s" % (target, reason),
+        "Vote for seat %d. %s is a wolf: %s" % (target, name, reason),
+        "Seat %d is where my vote is going. I think seat %d is a wolf: %s" % (
+            target, target, reason),
+    ]
+    if defence:
+        templates = [
+            "I am a villager, and my votes have followed the evidence. "
+            "I think seat %d is a wolf: %s" % (target, reason),
+            "I am not a wolf. Look at seat %d instead: %s is a wolf. %s" % (
+                target, name, reason),
+        ]
+    return _cut(_pick(rng, templates), max_chars)
+
+
 def _entry_speak(a, max_chars):
     """Entry-only speak gate (the house never runs this; decide() calls it
-    instead of speak()). A baseless accusation is worse than silence: the
-    village's own suspicion rules punish whoever accused a later-revealed
-    villager, so a day-one guess usually paints the accuser and misleads
-    the table. When the entry has no real case -- no checked wolf, no false
-    seer to counter, no accusation to answer, and the top suspect scores
-    under 1.0 -- say plainly that there is no case yet instead of naming
-    one. Reveals, counter-claims and defences still go through speak()."""
-    suspects = a.top_suspects()
-    top = suspects[0] if suspects else None
-    top_score = a.suspicion.get(top, 0.0) if top is not None else 0.0
+    instead of speak()). Speech follows the vote: when the entry has a
+    case worth voting on, it names that seat with a parseable accusation
+    instead of staying silent or speaking vaguely, so the table can follow
+    the vote. Reveals, counter-claims and defences still go through
+    speak(). When there is no case -- no checked wolf, no false seer to
+    counter, no accusation to answer, and the top suspect scores under
+    1.0 -- say plainly that there is no case yet instead of naming one."""
+    if a.role == "werewolf":
+        return _entry_speak_wolf(a, max_chars)
     has_wolf = any(w in a.living for w in a.checked_wolf)
     # Only the seer needs the counter-claim exception: for other village
     # roles somebody else's seer claim is no reason to accuse on a guess.
     false_claim = a.role == "seer" and bool(a.claimed_seer_alive())
-    if (a.role != "werewolf" and not has_wolf and not false_claim
-            and not a.am_accused() and top_score < 1.0):
+    if has_wolf or false_claim:
+        return speak(a, max_chars)
+    if a.role == "seer":
+        # A checked-clear seat is the top suspect: reveal the clear to
+        # save them from exile. Revealing outs the seer, so only when
+        # the cleared seat is actually in danger (suspicion >= 1.0).
+        for t in a.top_suspects():
+            if t in a.checked_clear and a.suspicion.get(t, 0.0) >= 1.0:
+                return _cut("I am the seer. I checked seat %d (%s): not a wolf. "
+                            "Do not exile them -- vote on the real suspects." % (
+                                t, a.names[t]), max_chars)
+    target = _vote_intent(a)
+    if a.am_accused():
+        if target is not None:
+            return _entry_accuse(a, target, max_chars, defence=True)
+        return speak(a, max_chars)
+    if target is None:
         rng = _rng(a.seed, "speak-neutral", a.game_no, a.day, len(a.log))
         templates = [
             "Day %d, and I have no solid read yet. I would rather hear everyone than push a name on guesswork." % a.day,
@@ -621,9 +768,7 @@ def _entry_speak(a, max_chars):
             "Nothing has convinced me yet. I will keep watching and vote on evidence, not noise.",
         ]
         return _cut(_pick(rng, templates), max_chars)
-    if a.role == "werewolf":
-        return _entry_speak_wolf(a, max_chars)
-    return speak(a, max_chars)
+    return _entry_accuse(a, target, max_chars)
 
 
 def speak(a, max_chars):
@@ -646,12 +791,13 @@ def speak(a, max_chars):
 
 def _entry_speak_wolf(a, max_chars):
     """Entry-only wolf speak: the same voice as _speak_wolf, but it never
-    names the partner as a suspect -- not as the accusation target, and not
-    even inside a 'before we settle on X' deflection, which only puts the
-    partner's name in the frame as a candidate for exile. The partner is
-    defended by redirecting at the best non-partner suspect, never by
-    discussing them. (The shared _speak_wolf can bus the partner whenever
-    the village's own suspicion puts them on top; the entry must not.)"""
+    names the partner as a suspect -- except to bus them when the ledger
+    has already doomed them -- and it never LEADS an accusation. Quiet
+    wolf play (the top entries' signature): blend in, agree with the
+    table, and only amplify a case the village already made. A wolf that
+    opens the accusing paints itself; a wolf that agrees with the village
+    is just another villager. The partner is defended by redirecting at
+    the best non-partner suspect, never by discussing them."""
     rng = _rng(a.seed, "speak", a.game_no, a.day, len(a.log))
     if a.day == 1 and rng.random() < 0.15:
         return None
@@ -660,33 +806,27 @@ def _entry_speak_wolf(a, max_chars):
     suspects = [s for s in a.top_suspects() if s != a.partner]
     top = suspects[0] if suspects else None
     if a.am_accused() and top is not None:
-        text = ("I am a villager, and my votes have followed the evidence. "
-                "Look at %s instead: %s" % (a.names[top], a.evidence_reason(top)))
-        return _cut(text, max_chars)
+        return _entry_accuse(a, top, max_chars, defence=True)
     if top is None:
         return _cut("Not much to go on yet. I will listen and vote on what the day shows.", max_chars)
-    if a.partner is not None and a.suspicion.get(a.partner, 0.0) >= 2.0:
+    # Bussing: the partner is doomed (ledger suspicion very high) -- vote
+    # with the village against them and say so, to buy trust for the
+    # endgame. Never name the partner otherwise.
+    if (a.partner is not None and a.partner in a.living
+            and a.suspicion.get(a.partner, 0.0) >= 3.0):
+        return _entry_accuse(a, a.partner, max_chars)
+    # Quiet: only amplify a case the village already made. If nobody else
+    # has accused the top suspect yet, stay agreeable and neutral instead
+    # of opening the accusation myself.
+    accused_by_others = {t for (acc, t, _d, _s) in a.accusations if acc != a.me}
+    if top not in accused_by_others:
         templates = [
-            "%s worries me more than the names so far: %s" % (
-                a.names[top], a.evidence_reason(top)),
-            "Before we settle on anyone, look at %s. %s" % (
-                a.names[top], a.evidence_reason(top)),
+            "No strong read yet today. I am listening to the table.",
+            "I agree with what has been said so far. Let us hear everyone.",
+            "Nothing has convinced me yet. I will vote on the evidence.",
         ]
         return _cut(_pick(rng, templates), max_chars)
-    reason = a.evidence_reason(top)
-    name = a.names[top]
-    templates = [
-        "Seat %d (%s) is where my vote is going. %s" % (top, name, reason),
-        "I keep coming back to seat %d (%s). %s I am open to another name, but that is my read." % (top, name, reason),
-        "Seat %d (%s) has not added up for me. %s" % (top, name, reason),
-        "I agree with the case on seat %d (%s). %s" % (top, name, reason),
-        "Seat %d, why did you vote the way you did yesterday? %s" % (top, reason),
-        "The night kill points at someone who wanted the village weaker. Seat %d (%s) fits that best: %s" % (top, name, reason),
-    ]
-    if a.day == 1:
-        templates.append(
-            "First day, little to go on. I will watch seat %d (%s) for now: %s" % (top, name, reason))
-    return _cut(_pick(rng, templates), max_chars)
+    return _entry_accuse(a, top, max_chars)
 
 
 def _speak_wolf(a, rng, top, max_chars):
